@@ -1166,6 +1166,7 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
         Content content;
         content.type = TEXT;
 
+        // --- Role detection ---
         if (item.contains("role") && item["role"] == "system")
         {
             content.role = SYSTEM;
@@ -1178,20 +1179,33 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
         {
             content.role = ASSISTANT;
         }
+        else if (item.contains("role") && item["role"] == "tool")
+        {
+            content.role = TOOL;
+            if (item.contains("tool_call_id"))
+                content.tool_call_id = item["tool_call_id"].get<std::string>();
+            if (item.contains("name"))
+                content.name = item["name"].get<std::string>();
+        }
         else
         {
-            ALOGE("content type not support");
+            ALOGE("unsupported role: %s",
+                  item.contains("role") ? item["role"].get<std::string>().c_str() : "(missing)");
             return false;
         }
 
+        // --- Content parsing ---
         std::vector<std::string> media_uris;
         ContentType media_type = TEXT;
 
-        if (item.contains("content") && item["content"].is_string())
+        // null / missing content is valid (e.g. assistant with only tool_calls, or tool messages)
+        bool has_content = item.contains("content") && !item["content"].is_null();
+
+        if (has_content && item["content"].is_string())
         {
-            content.data = item["content"];
+            content.data = item["content"].get<std::string>();
         }
-        else if (item.contains("content") && item["content"].is_array())
+        else if (has_content && item["content"].is_array())
         {
             for (auto &c : item["content"])
             {
@@ -1243,10 +1257,35 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
                 }
             }
         }
-        else
+        // null/missing content: leave data empty (valid for tool_calls-only assistant messages)
+
+        // --- tool_calls in assistant messages ---
+        // Convert OpenAI-style tool_calls to <|tool_call|> markup for the chat template
+        if (content.role == ASSISTANT && item.contains("tool_calls") && item["tool_calls"].is_array())
         {
-            ALOGE("content type not support");
-            return false;
+            for (const auto &tc : item["tool_calls"])
+            {
+                if (!tc.contains("function")) continue;
+                const auto &func = tc["function"];
+                std::string func_name = func.value("name", "");
+                std::string func_args = func.value("arguments", "");
+
+                std::string tc_str = "<|tool_call|>{\"name\":\"" + func_name + "\",\"arguments\":";
+                // Try to keep arguments as formatted JSON
+                try
+                {
+                    auto args_json = nlohmann::json::parse(func_args);
+                    tc_str += args_json.dump();
+                }
+                catch (...)
+                {
+                    tc_str += "\"" + func_args + "\"";
+                }
+                tc_str += "}<|/tool_call|>";
+
+                if (!content.data.empty()) content.data += "\n";
+                content.data += tc_str;
+            }
         }
 
         if (!media_uris.empty() && content.role == USER)
@@ -1261,6 +1300,90 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
     }
 
     return true;
+}
+
+// ============ Tool / Function Calling Helpers ============
+
+// Parse tool calls from model output text.
+// The model outputs <|tool_call|>JSON<|/tool_call|> markers around tool invocations.
+// Returns true if any tool calls were found, and fills out_tool_calls with parsed JSON objects.
+// Also returns cleaned_text with the tool call markup removed.
+static bool parse_tool_calls_from_output(const std::string &output_text,
+                                          std::vector<nlohmann::json> &out_tool_calls,
+                                          std::string &cleaned_text)
+{
+    static const std::string k_start = "<|tool_call|>";
+    static const std::string k_end   = "<|/tool_call|>";
+
+    cleaned_text = output_text;
+    out_tool_calls.clear();
+
+    size_t pos = 0;
+    bool found_any = false;
+
+    while (true)
+    {
+        size_t start = cleaned_text.find(k_start, pos);
+        if (start == std::string::npos) break;
+
+        size_t end = cleaned_text.find(k_end, start + k_start.size());
+        if (end == std::string::npos) break;
+
+        found_any = true;
+
+        std::string json_str = cleaned_text.substr(start + k_start.size(),
+                                                    end - start - k_start.size());
+        try
+        {
+            auto tc = nlohmann::json::parse(json_str);
+            out_tool_calls.push_back(std::move(tc));
+        }
+        catch (const std::exception &e)
+        {
+            ALOGW("Failed to parse tool call JSON: %s  (raw: %s)", e.what(), json_str.c_str());
+        }
+
+        // Strip the markup from the cleaned text
+        cleaned_text.erase(start, end + k_end.size() - start);
+        pos = start;
+    }
+
+    return found_any;
+}
+
+static std::string generate_tool_call_id()
+{
+    static std::atomic<uint64_t> s_counter{0};
+    uint64_t id = s_counter.fetch_add(1, std::memory_order_relaxed);
+    return "call_" + std::to_string(id);
+}
+
+// Build or extend the system prompt with tool function definitions.
+// Follows the Qwen3.5 chat template convention.
+static std::string build_system_prompt_with_tools(const std::string &existing_prompt,
+                                                   const std::vector<nlohmann::json> &tools)
+{
+    std::string prompt = existing_prompt.empty()
+        ? "You are a helpful assistant."
+        : existing_prompt;
+
+    // Ensure trailing newline before appending
+    if (!prompt.empty() && prompt.back() != '\n') prompt += '\n';
+    prompt += "\nYou have access to the following functions:\n";
+
+    nlohmann::json funcs = nlohmann::json::array();
+    for (const auto &tool : tools)
+    {
+        // OpenAI format: {"type":"function","function":{...}}
+        if (tool.contains("function"))
+            funcs.push_back(tool["function"]);
+        else
+            funcs.push_back(tool);
+    }
+    prompt += funcs.dump(2);
+    prompt += "\n\nYou MUST call functions when appropriate.";
+
+    return prompt;
 }
 
 // Run server mode
@@ -1462,47 +1585,157 @@ int run_server_mode(const ModelConfig &config, int port)
             return;
         }
 
-        if (req.stream) {
-            bool streamed_any = false;
-            auto callback = [provider, model_id = req.model, &streamed_any](std::string str, float token_per_sec, void *reserve) {
-                if (!provider->is_writable()) {
-                    ALOGE("provider not writable");
-                    return;
-                }
-                if (!str.empty()) streamed_any = true;
-                auto chunk = openai_api::OutputChunk::TextDelta(str, model_id);
-                provider->push(chunk);
-                fprintf(stdout, "%s", str.c_str());
-                fflush(stdout);
-            };
+        // --- Inject tool definitions if the request has tools ---
+        // Check tool_choice: if explicitly "none", skip tool injection
+        bool tool_choice_is_none = req.tool_choice.is_string() &&
+                                   req.tool_choice.get<std::string>() == "none";
+        bool has_tools = !req.tools.empty() && !tool_choice_is_none;
+        if (has_tools)
+        {
+            // Merge tool definitions into the system prompt (first message)
+            if (!history.empty() && history[0].role == SYSTEM)
+            {
+                history[0].data = build_system_prompt_with_tools(history[0].data, req.tools);
+            }
+            else
+            {
+                Content sys;
+                sys.role = SYSTEM;
+                sys.type = TEXT;
+                sys.data = build_system_prompt_with_tools("", req.tools);
+                history.insert(history.begin(), sys);
+            }
+        }
 
-            llm.getAttr()->runing_callback = callback;
-            if (!media_inputs.empty()) llm.Run(history, media_inputs, req.max_tokens);
-            else llm.Run(history, req.max_tokens);
-            const std::string llm_error = llm.GetLastError();
-            if (!llm_error.empty() && !streamed_any) {
-                ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
-                provider->push(openai_api::OutputChunk::TextDelta(llm_error, req.model));
-                provider->push(openai_api::OutputChunk::FinalText("", req.model));
+        // --- Streaming ---
+        if (req.stream) {
+            // When tools are present, we buffer all output and replay at the end
+            // to allow proper tool call parsing. Without tools, stream in real-time.
+            if (has_tools) {
+                // Buffered streaming mode
+                std::string buffer;
+                auto callback = [&buffer](std::string str, float, void*) {
+                    buffer += str;
+                };
+                llm.getAttr()->runing_callback = callback;
+                if (!media_inputs.empty()) llm.Run(history, media_inputs, req.max_tokens);
+                else llm.Run(history, req.max_tokens);
+
+                std::vector<nlohmann::json> tool_calls_json;
+                std::string cleaned_text;
+                bool found_tc = parse_tool_calls_from_output(buffer, tool_calls_json, cleaned_text);
+
+                if (found_tc) {
+                    // Emit ToolCallDelta chunks (simulate streaming)
+                    for (size_t i = 0; i < tool_calls_json.size(); i++) {
+                        auto &tc = tool_calls_json[i];
+                        std::string name = tc.value("name", "");
+                        std::string args = tc.contains("arguments")
+                            ? tc["arguments"].dump()
+                            : "{}";
+                        std::string id = generate_tool_call_id();
+                        // Send the entire args as a single delta for simplicity
+                        auto delta = openai_api::OutputChunk::ToolCallDelta(
+                            id, name, args, (int)i, req.model);
+                        provider->push(delta);
+                    }
+                    // Final with finish_reason "tool_calls"
+                    provider->push(openai_api::OutputChunk::FinalText("", req.model));
+                    ALOGI("Streaming response with %zu tool call(s)", tool_calls_json.size());
+                } else {
+                    // No tool calls — replay buffered text as a single delta
+                    if (!buffer.empty()) {
+                        provider->push(openai_api::OutputChunk::TextDelta(buffer, req.model));
+                        fprintf(stdout, "%s", buffer.c_str());
+                        fflush(stdout);
+                    }
+                    provider->push(openai_api::OutputChunk::FinalText(buffer, req.model));
+                }
+            } else {
+                // Real-time streaming (no tools)
+                bool streamed_any = false;
+                auto callback = [provider, model_id = req.model, &streamed_any](std::string str, float, void*) {
+                    if (!provider->is_writable()) {
+                        ALOGE("provider not writable");
+                        return;
+                    }
+                    if (!str.empty()) streamed_any = true;
+                    auto chunk = openai_api::OutputChunk::TextDelta(str, model_id);
+                    provider->push(chunk);
+                    fprintf(stdout, "%s", str.c_str());
+                    fflush(stdout);
+                };
+                llm.getAttr()->runing_callback = callback;
+                if (!media_inputs.empty()) llm.Run(history, media_inputs, req.max_tokens);
+                else llm.Run(history, req.max_tokens);
+                const std::string llm_error = llm.GetLastError();
+                if (!llm_error.empty() && !streamed_any) {
+                    ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
+                    provider->push(openai_api::OutputChunk::TextDelta(llm_error, req.model));
+                    provider->push(openai_api::OutputChunk::FinalText("", req.model));
+                }
             }
         } else {
+            // --- Non-streaming ---
             llm.getAttr()->runing_callback = nullptr;
-            auto out_history = (!media_inputs.empty()) ? llm.Run(history, media_inputs, req.max_tokens) : llm.Run(history, req.max_tokens);
-            std::string final_text;
+            auto out_history = (!media_inputs.empty())
+                ? llm.Run(history, media_inputs, req.max_tokens)
+                : llm.Run(history, req.max_tokens);
+            std::string output_text;
             if (!out_history.empty() && out_history.back().role == ASSISTANT) {
-                final_text = out_history.back().data;
+                output_text = out_history.back().data;
             }
-            if (final_text.empty()) {
+            if (output_text.empty()) {
                 const std::string llm_error = llm.GetLastError();
                 if (!llm_error.empty()) {
                     ALOGW("Returning user-facing chat error: %s", llm_error.c_str());
-                    final_text = llm_error;
+                    output_text = llm_error;
                 }
             }
-            auto chunk = openai_api::OutputChunk::FinalText(final_text, req.model);
-            fprintf(stdout, "%s", final_text.c_str());
-            fflush(stdout);
-            provider->push(chunk);
+
+            // Parse for tool calls
+            std::vector<nlohmann::json> tool_calls_json;
+            std::string cleaned_text;
+            bool found_tc = parse_tool_calls_from_output(output_text, tool_calls_json, cleaned_text);
+
+            if (found_tc) {
+                // Emit ToolCallFinal chunks (server.cpp's non-streaming handler merges them)
+                for (size_t i = 0; i < tool_calls_json.size(); i++) {
+                    auto &tc = tool_calls_json[i];
+                    std::string name = tc.value("name", "");
+                    std::string args = tc.contains("arguments")
+                        ? tc["arguments"].dump()
+                        : "{}";
+                    std::string id = generate_tool_call_id();
+                    auto chunk = openai_api::OutputChunk::ToolCallFinal(
+                        id, name, args, (int)i, req.model);
+                    provider->push(chunk);
+                }
+                // Final with tool_calls set so the JSON encoder picks it up
+                auto final_chunk = openai_api::OutputChunk::FinalText("", req.model);
+                // Build the tool_calls array for the JSON encoder
+                nlohmann::json tc_arr = nlohmann::json::array();
+                for (size_t i = 0; i < tool_calls_json.size(); i++) {
+                    auto &tc = tool_calls_json[i];
+                    nlohmann::json entry;
+                    entry["id"] = tc.contains("id") ? tc["id"].get<std::string>() : generate_tool_call_id();
+                    entry["type"] = "function";
+                    entry["function"]["name"] = tc.value("name", "");
+                    entry["function"]["arguments"] = tc.contains("arguments")
+                        ? tc["arguments"].dump()
+                        : "{}";
+                    tc_arr.push_back(std::move(entry));
+                }
+                final_chunk.obj["tool_calls"] = std::move(tc_arr);
+                provider->push(final_chunk);
+                ALOGI("Non-streaming response with %zu tool call(s)", tool_calls_json.size());
+            } else {
+                // Normal text response (no tool calls)
+                auto chunk = openai_api::OutputChunk::FinalText(output_text, req.model);
+                fprintf(stdout, "%s", output_text.c_str());
+                fflush(stdout);
+                provider->push(chunk);
+            }
         }
 
         cleanup_temp_files(temp_files);

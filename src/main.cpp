@@ -1873,7 +1873,7 @@ int run_server_mode(const ModelConfig &config, int port)
 
                 std::vector<nlohmann::json> tool_calls_json;
                 std::string cleaned_text;
-                bool found_tc = parse_tool_calls_from_output(buffer, tool_calls_json, cleaned_text);
+                bool found_tc = has_tools && parse_tool_calls_from_output(buffer, tool_calls_json, cleaned_text);
 
                 if (found_tc) {
                     normalize_tool_call_names(tool_calls_json, req.tools);
@@ -1947,7 +1947,7 @@ int run_server_mode(const ModelConfig &config, int port)
             // Parse for tool calls
             std::vector<nlohmann::json> tool_calls_json;
             std::string cleaned_text;
-            bool found_tc = parse_tool_calls_from_output(output_text, tool_calls_json, cleaned_text);
+            bool found_tc = has_tools && parse_tool_calls_from_output(output_text, tool_calls_json, cleaned_text);
 
             if (found_tc) {
                 normalize_tool_call_names(tool_calls_json, req.tools);

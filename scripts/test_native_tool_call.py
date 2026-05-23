@@ -4,7 +4,7 @@ import json
 import sys
 from typing import Any
 
-from openai import OpenAI
+from openai import APIStatusError, OpenAI
 
 
 def parse_args() -> argparse.Namespace:
@@ -118,14 +118,19 @@ def main() -> int:
     ]
 
     print("==> Requesting tool call")
-    first = client.chat.completions.create(
-        model=args.model,
-        messages=messages,
-        tools=tools,
-        tool_choice={"type": "function", "function": {"name": "get_weather"}},
-        temperature=0,
-        max_tokens=args.max_tokens,
-    )
+    try:
+        first = client.chat.completions.create(
+            model=args.model,
+            messages=messages,
+            tools=tools,
+            tool_choice={"type": "function", "function": {"name": "get_weather"}},
+            temperature=0,
+            max_tokens=args.max_tokens,
+        )
+    except APIStatusError as exc:
+        print(f"FAIL: first request returned HTTP {exc.status_code}", file=sys.stderr)
+        print(exc.response.text, file=sys.stderr)
+        return 1
 
     choice = first.choices[0]
     assistant_message = choice.message
@@ -152,12 +157,17 @@ def main() -> int:
         )
 
     print("==> Sending tool result back")
-    second = client.chat.completions.create(
-        model=args.model,
-        messages=messages,
-        temperature=0,
-        max_tokens=args.max_tokens,
-    )
+    try:
+        second = client.chat.completions.create(
+            model=args.model,
+            messages=messages,
+            temperature=0,
+            max_tokens=args.max_tokens,
+        )
+    except APIStatusError as exc:
+        print(f"FAIL: second request returned HTTP {exc.status_code}", file=sys.stderr)
+        print(exc.response.text, file=sys.stderr)
+        return 1
 
     final_message = second.choices[0].message
     content = final_message.content or ""

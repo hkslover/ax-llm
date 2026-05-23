@@ -1530,6 +1530,52 @@ static std::string tool_choice_for_log(const nlohmann::json &tool_choice)
     return dumped;
 }
 
+static std::string compact_tool_name(const std::string &name)
+{
+    std::string compact;
+    for (unsigned char ch : name)
+    {
+        if (std::isalnum(ch))
+        {
+            compact.push_back(static_cast<char>(std::tolower(ch)));
+        }
+    }
+    return compact;
+}
+
+static void normalize_tool_call_names(std::vector<nlohmann::json> &tool_calls,
+                                      const std::vector<nlohmann::json> &tools)
+{
+    std::map<std::string, std::string> canonical_names;
+    for (const auto &tool : tools)
+    {
+        std::string name;
+        if (tool.is_object() && tool.contains("function") && tool["function"].is_object())
+            name = tool["function"].value("name", "");
+        else if (tool.is_object())
+            name = tool.value("name", "");
+
+        if (!name.empty())
+            canonical_names[compact_tool_name(name)] = name;
+    }
+
+    if (canonical_names.empty()) return;
+
+    for (auto &tc : tool_calls)
+    {
+        if (!tc.is_object() || !tc.contains("name") || !tc["name"].is_string()) continue;
+        std::string raw_name = tc["name"].get<std::string>();
+        auto it = canonical_names.find(compact_tool_name(raw_name));
+        if (it != canonical_names.end() && raw_name != it->second)
+        {
+            ALOGI("Native tool call: normalized tool name '%s' -> '%s'",
+                  raw_name.c_str(),
+                  it->second.c_str());
+            tc["name"] = it->second;
+        }
+    }
+}
+
 // Build or extend the system prompt with tool function definitions.
 // Follows the Qwen3.5 chat template convention.
 static std::string build_system_prompt_with_tools(const std::string &existing_prompt,
@@ -1830,6 +1876,7 @@ int run_server_mode(const ModelConfig &config, int port)
                 bool found_tc = parse_tool_calls_from_output(buffer, tool_calls_json, cleaned_text);
 
                 if (found_tc) {
+                    normalize_tool_call_names(tool_calls_json, req.tools);
                     // Emit ToolCallDelta chunks (simulate streaming)
                     for (size_t i = 0; i < tool_calls_json.size(); i++) {
                         auto &tc = tool_calls_json[i];
@@ -1903,6 +1950,7 @@ int run_server_mode(const ModelConfig &config, int port)
             bool found_tc = parse_tool_calls_from_output(output_text, tool_calls_json, cleaned_text);
 
             if (found_tc) {
+                normalize_tool_call_names(tool_calls_json, req.tools);
                 // Emit ToolCallFinal chunks (server.cpp's non-streaming handler merges them)
                 for (size_t i = 0; i < tool_calls_json.size(); i++) {
                     auto &tc = tool_calls_json[i];

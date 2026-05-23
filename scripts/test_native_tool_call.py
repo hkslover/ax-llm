@@ -51,7 +51,15 @@ def get_weather(location: str) -> dict[str, Any]:
     }
 
 
+def normalize_tool_name(name: str) -> str:
+    normalized = "".join(ch for ch in name.lower() if ch.isalnum())
+    if normalized == "getweather":
+        return "get_weather"
+    return name
+
+
 def tool_result(name: str, arguments: str) -> str:
+    name = normalize_tool_name(name)
     try:
         parsed_args = json.loads(arguments or "{}")
     except json.JSONDecodeError as exc:

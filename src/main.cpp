@@ -1322,15 +1322,6 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
 
 // ============ Tool / Function Calling Helpers ============
 
-static std::string trim_copy(const std::string &value)
-{
-    size_t begin = 0;
-    while (begin < value.size() && std::isspace(static_cast<unsigned char>(value[begin]))) begin++;
-    size_t end = value.size();
-    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) end--;
-    return value.substr(begin, end - begin);
-}
-
 static bool parse_legacy_json_tool_call_block(const std::string &output_text,
                                               std::vector<nlohmann::json> &out_tool_calls,
                                               std::string &cleaned_text)

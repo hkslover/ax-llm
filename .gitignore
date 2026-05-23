@@ -19,3 +19,5 @@ scripts/__pycache__/
 scripts/cert.pem
 scripts/key.pem
 scripts/output.wav
+
+.DS_Store

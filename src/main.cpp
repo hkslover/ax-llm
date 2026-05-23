@@ -1358,6 +1358,42 @@ static std::string generate_tool_call_id()
     return "call_" + std::to_string(id);
 }
 
+static std::string summarize_tool_names_for_log(const std::vector<nlohmann::json> &tools)
+{
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < tools.size(); ++i)
+    {
+        if (i > 0) oss << ",";
+        const auto &tool = tools[i];
+        std::string name;
+        if (tool.is_object() && tool.contains("function") && tool["function"].is_object())
+        {
+            name = tool["function"].value("name", "");
+        }
+        else if (tool.is_object())
+        {
+            name = tool.value("name", "");
+        }
+        oss << (name.empty() ? "<unnamed>" : name);
+    }
+    oss << "]";
+    return oss.str();
+}
+
+static std::string tool_choice_for_log(const nlohmann::json &tool_choice)
+{
+    if (tool_choice.is_null()) return "<unset>";
+    std::string dumped = tool_choice.dump();
+    constexpr size_t kMaxLen = 256;
+    if (dumped.size() > kMaxLen)
+    {
+        dumped.resize(kMaxLen);
+        dumped += "...";
+    }
+    return dumped;
+}
+
 // Build or extend the system prompt with tool function definitions.
 // Follows the Qwen3.5 chat template convention.
 static std::string build_system_prompt_with_tools(const std::string &existing_prompt,
@@ -1552,7 +1588,9 @@ int run_server_mode(const ModelConfig &config, int port)
             return;
         }
 
-        ALOGI("OpenAI chat request: model=%s stream=%d max_tokens=%d has_temperature=%d temperature=%.4f has_top_p=%d top_p=%.4f messages=%zu stop=%zu",
+        const std::string tool_names = summarize_tool_names_for_log(req.tools);
+        const std::string tool_choice_log = tool_choice_for_log(req.tool_choice);
+        ALOGI("OpenAI chat request: model=%s stream=%d max_tokens=%d has_temperature=%d temperature=%.4f has_top_p=%d top_p=%.4f messages=%zu stop=%zu tools=%zu tool_names=%s tool_choice=%s",
               req.model.c_str(),
               req.stream ? 1 : 0,
               req.max_tokens,
@@ -1561,7 +1599,10 @@ int run_server_mode(const ModelConfig &config, int port)
               req.has_top_p ? 1 : 0,
               req.top_p,
               req.parsed_messages.size(),
-              req.stop.size());
+              req.stop.size(),
+              req.tools.size(),
+              tool_names.c_str(),
+              tool_choice_log.c_str());
 
         struct SamplingOverrideGuard {
             LLM &llm;
@@ -1596,6 +1637,10 @@ int run_server_mode(const ModelConfig &config, int port)
             if (!history.empty() && history[0].role == SYSTEM)
             {
                 history[0].data = build_system_prompt_with_tools(history[0].data, req.tools);
+                ALOGI("Native tool call: injected %zu tool(s) into existing system prompt. tool_names=%s system_prompt_chars=%zu",
+                      req.tools.size(),
+                      tool_names.c_str(),
+                      history[0].data.size());
             }
             else
             {
@@ -1604,7 +1649,16 @@ int run_server_mode(const ModelConfig &config, int port)
                 sys.type = TEXT;
                 sys.data = build_system_prompt_with_tools("", req.tools);
                 history.insert(history.begin(), sys);
+                ALOGI("Native tool call: inserted system prompt with %zu tool(s). tool_names=%s system_prompt_chars=%zu",
+                      req.tools.size(),
+                      tool_names.c_str(),
+                      history[0].data.size());
             }
+        }
+        else if (!req.tools.empty())
+        {
+            ALOGI("Native tool call: request contained %zu tool(s), but injection skipped because tool_choice is none",
+                  req.tools.size());
         }
 
         // --- Streaming ---

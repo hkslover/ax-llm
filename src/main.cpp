@@ -1260,7 +1260,7 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
         // null/missing content: leave data empty (valid for tool_calls-only assistant messages)
 
         // --- tool_calls in assistant messages ---
-        // Convert OpenAI-style tool_calls to <|tool_call|> markup for the chat template
+        // Convert OpenAI-style tool_calls to Qwen3.5 XML tool-call markup.
         if (content.role == ASSISTANT && item.contains("tool_calls") && item["tool_calls"].is_array())
         {
             for (const auto &tc : item["tool_calls"])
@@ -1270,18 +1270,36 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
                 std::string func_name = func.value("name", "");
                 std::string func_args = func.value("arguments", "");
 
-                std::string tc_str = "<|tool_call|>{\"name\":\"" + func_name + "\",\"arguments\":";
-                // Try to keep arguments as formatted JSON
+                nlohmann::json args_json = nlohmann::json::object();
                 try
                 {
-                    auto args_json = nlohmann::json::parse(func_args);
-                    tc_str += args_json.dump();
+                    args_json = nlohmann::json::parse(func_args);
                 }
                 catch (...)
                 {
-                    tc_str += "\"" + func_args + "\"";
+                    args_json["arguments"] = func_args;
                 }
-                tc_str += "}<|/tool_call|>";
+
+                std::string tc_str = "<tool_call>\n<function=" + func_name + ">\n";
+                if (args_json.is_object())
+                {
+                    for (auto it = args_json.begin(); it != args_json.end(); ++it)
+                    {
+                        tc_str += "<parameter=" + it.key() + ">\n";
+                        if (it.value().is_string())
+                            tc_str += it.value().get<std::string>();
+                        else
+                            tc_str += it.value().dump();
+                        tc_str += "\n</parameter>\n";
+                    }
+                }
+                else
+                {
+                    tc_str += "<parameter=arguments>\n";
+                    tc_str += args_json.dump();
+                    tc_str += "\n</parameter>\n";
+                }
+                tc_str += "</function>\n</tool_call>";
 
                 if (!content.data.empty()) content.data += "\n";
                 content.data += tc_str;
@@ -1304,23 +1322,24 @@ bool handle_api_messages(const nlohmann::json &messages, std::vector<Content> &h
 
 // ============ Tool / Function Calling Helpers ============
 
-// Parse tool calls from model output text.
-// The model outputs <|tool_call|>JSON<|/tool_call|> markers around tool invocations.
-// Returns true if any tool calls were found, and fills out_tool_calls with parsed JSON objects.
-// Also returns cleaned_text with the tool call markup removed.
-static bool parse_tool_calls_from_output(const std::string &output_text,
-                                          std::vector<nlohmann::json> &out_tool_calls,
-                                          std::string &cleaned_text)
+static std::string trim_copy(const std::string &value)
+{
+    size_t begin = 0;
+    while (begin < value.size() && std::isspace(static_cast<unsigned char>(value[begin]))) begin++;
+    size_t end = value.size();
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1]))) end--;
+    return value.substr(begin, end - begin);
+}
+
+static bool parse_legacy_json_tool_call_block(const std::string &output_text,
+                                              std::vector<nlohmann::json> &out_tool_calls,
+                                              std::string &cleaned_text)
 {
     static const std::string k_start = "<|tool_call|>";
     static const std::string k_end   = "<|/tool_call|>";
 
-    cleaned_text = output_text;
-    out_tool_calls.clear();
-
-    size_t pos = 0;
     bool found_any = false;
-
+    size_t pos = 0;
     while (true)
     {
         size_t start = cleaned_text.find(k_start, pos);
@@ -1329,26 +1348,152 @@ static bool parse_tool_calls_from_output(const std::string &output_text,
         size_t end = cleaned_text.find(k_end, start + k_start.size());
         if (end == std::string::npos) break;
 
-        found_any = true;
-
         std::string json_str = cleaned_text.substr(start + k_start.size(),
                                                     end - start - k_start.size());
         try
         {
             auto tc = nlohmann::json::parse(json_str);
             out_tool_calls.push_back(std::move(tc));
+            found_any = true;
         }
         catch (const std::exception &e)
         {
-            ALOGW("Failed to parse tool call JSON: %s  (raw: %s)", e.what(), json_str.c_str());
+            ALOGW("Failed to parse legacy tool call JSON: %s  (raw: %s)", e.what(), json_str.c_str());
         }
 
-        // Strip the markup from the cleaned text
         cleaned_text.erase(start, end + k_end.size() - start);
         pos = start;
     }
 
+    (void)output_text;
     return found_any;
+}
+
+static bool parse_qwen35_xml_tool_call_block(const std::string &output_text,
+                                             std::vector<nlohmann::json> &out_tool_calls,
+                                             std::string &cleaned_text)
+{
+    static const std::string k_tool_start = "<tool_call>";
+    static const std::string k_tool_end = "</tool_call>";
+    static const std::string k_function_start = "<function=";
+    static const std::string k_function_end = "</function>";
+    static const std::string k_parameter_start = "<parameter=";
+    static const std::string k_parameter_end = "</parameter>";
+
+    bool found_any = false;
+    size_t pos = 0;
+    while (true)
+    {
+        size_t start = cleaned_text.find(k_tool_start, pos);
+        if (start == std::string::npos) break;
+
+        size_t end = cleaned_text.find(k_tool_end, start + k_tool_start.size());
+        if (end == std::string::npos) break;
+
+        std::string block = cleaned_text.substr(start + k_tool_start.size(),
+                                                end - start - k_tool_start.size());
+        size_t func_start = block.find(k_function_start);
+        if (func_start == std::string::npos)
+        {
+            ALOGW("Failed to parse Qwen3.5 tool call: missing <function=> block (raw: %s)",
+                  block.c_str());
+            pos = end + k_tool_end.size();
+            continue;
+        }
+
+        size_t func_name_start = func_start + k_function_start.size();
+        size_t func_name_end = block.find(">", func_name_start);
+        if (func_name_end == std::string::npos)
+        {
+            ALOGW("Failed to parse Qwen3.5 tool call: unterminated function name (raw: %s)",
+                  block.c_str());
+            pos = end + k_tool_end.size();
+            continue;
+        }
+
+        std::string func_name = trim_copy(block.substr(func_name_start, func_name_end - func_name_start));
+        size_t func_body_end = block.find(k_function_end, func_name_end + 1);
+        if (func_body_end == std::string::npos)
+        {
+            ALOGW("Failed to parse Qwen3.5 tool call: missing </function> (raw: %s)",
+                  block.c_str());
+            pos = end + k_tool_end.size();
+            continue;
+        }
+
+        std::string func_body = block.substr(func_name_end + 1, func_body_end - func_name_end - 1);
+        nlohmann::json args = nlohmann::json::object();
+
+        size_t param_pos = 0;
+        while (true)
+        {
+            size_t param_start = func_body.find(k_parameter_start, param_pos);
+            if (param_start == std::string::npos) break;
+
+            size_t param_name_start = param_start + k_parameter_start.size();
+            size_t param_name_end = func_body.find(">", param_name_start);
+            if (param_name_end == std::string::npos) break;
+
+            std::string param_name = trim_copy(func_body.substr(param_name_start,
+                                                                param_name_end - param_name_start));
+            size_t param_value_start = param_name_end + 1;
+            size_t param_end = func_body.find(k_parameter_end, param_value_start);
+            if (param_end == std::string::npos) break;
+
+            std::string param_value = trim_copy(func_body.substr(param_value_start,
+                                                                 param_end - param_value_start));
+            if (!param_name.empty())
+            {
+                try
+                {
+                    args[param_name] = nlohmann::json::parse(param_value);
+                }
+                catch (...)
+                {
+                    args[param_name] = param_value;
+                }
+            }
+            param_pos = param_end + k_parameter_end.size();
+        }
+
+        if (func_name.empty())
+        {
+            ALOGW("Failed to parse Qwen3.5 tool call: empty function name (raw: %s)",
+                  block.c_str());
+            pos = end + k_tool_end.size();
+            continue;
+        }
+
+        nlohmann::json tc;
+        tc["name"] = func_name;
+        tc["arguments"] = std::move(args);
+        out_tool_calls.push_back(std::move(tc));
+        found_any = true;
+
+        cleaned_text.erase(start, end + k_tool_end.size() - start);
+        pos = start;
+    }
+
+    (void)output_text;
+    return found_any;
+}
+
+// Parse tool calls from model output text.
+// Qwen3.5 uses XML tool calls:
+// <tool_call><function=name><parameter=k>v</parameter></function></tool_call>.
+// The legacy <|tool_call|>{json}<|/tool_call|> format is also accepted.
+// Returns true if any tool calls were found, and fills out_tool_calls with parsed JSON objects.
+// Also returns cleaned_text with the tool call markup removed.
+static bool parse_tool_calls_from_output(const std::string &output_text,
+                                          std::vector<nlohmann::json> &out_tool_calls,
+                                          std::string &cleaned_text)
+{
+    cleaned_text = output_text;
+    out_tool_calls.clear();
+
+    bool found_xml = parse_qwen35_xml_tool_call_block(output_text, out_tool_calls, cleaned_text);
+    bool found_legacy = parse_legacy_json_tool_call_block(output_text, out_tool_calls, cleaned_text);
+    return found_xml || found_legacy;
 }
 
 static std::string generate_tool_call_id()
@@ -1399,25 +1544,39 @@ static std::string tool_choice_for_log(const nlohmann::json &tool_choice)
 static std::string build_system_prompt_with_tools(const std::string &existing_prompt,
                                                    const std::vector<nlohmann::json> &tools)
 {
-    std::string prompt = existing_prompt.empty()
-        ? "You are a helpful assistant."
-        : existing_prompt;
-
-    // Ensure trailing newline before appending
-    if (!prompt.empty() && prompt.back() != '\n') prompt += '\n';
-    prompt += "\nYou have access to the following functions:\n";
-
-    nlohmann::json funcs = nlohmann::json::array();
+    std::string prompt;
+    prompt += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
     for (const auto &tool : tools)
     {
-        // OpenAI format: {"type":"function","function":{...}}
-        if (tool.contains("function"))
-            funcs.push_back(tool["function"]);
-        else
-            funcs.push_back(tool);
+        prompt += "\n";
+        prompt += tool.dump();
     }
-    prompt += funcs.dump(2);
-    prompt += "\n\nYou MUST call functions when appropriate.";
+    prompt += "\n</tools>";
+    prompt += "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n";
+    prompt += "<tool_call>\n";
+    prompt += "<function=example_function_name>\n";
+    prompt += "<parameter=example_parameter_1>\n";
+    prompt += "value_1\n";
+    prompt += "</parameter>\n";
+    prompt += "<parameter=example_parameter_2>\n";
+    prompt += "This is the value for the second parameter\nthat can span\nmultiple lines\n";
+    prompt += "</parameter>\n";
+    prompt += "</function>\n";
+    prompt += "</tool_call>\n\n";
+    prompt += "<IMPORTANT>\n";
+    prompt += "Reminder:\n";
+    prompt += "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n";
+    prompt += "- Required parameters MUST be specified\n";
+    prompt += "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n";
+    prompt += "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n";
+    prompt += "</IMPORTANT>";
+
+    std::string system_content = trim_copy(existing_prompt);
+    if (!system_content.empty())
+    {
+        prompt += "\n\n";
+        prompt += system_content;
+    }
 
     return prompt;
 }

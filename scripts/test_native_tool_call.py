@@ -33,6 +33,12 @@ def parse_args() -> argparse.Namespace:
         default=256,
         help="max_tokens for each chat request. Default: 256",
     )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=300.0,
+        help="Client request timeout in seconds. Default: 300",
+    )
     return parser.parse_args()
 
 
@@ -63,7 +69,12 @@ def tool_result(name: str, arguments: str) -> str:
 
 def main() -> int:
     args = parse_args()
-    client = OpenAI(api_key=args.api_key, base_url=args.api_url.strip())
+    client = OpenAI(
+        api_key=args.api_key,
+        base_url=args.api_url.strip(),
+        timeout=args.timeout,
+        max_retries=0,
+    )
 
     tools = [
         {
@@ -144,7 +155,6 @@ def main() -> int:
     second = client.chat.completions.create(
         model=args.model,
         messages=messages,
-        tools=tools,
         temperature=0,
         max_tokens=args.max_tokens,
     )
